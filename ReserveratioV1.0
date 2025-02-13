@@ -1,1 +1,167 @@
+// programs/crecoin/src/lib.rs
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer, Burn};
+
+declare_id!("2K3BgyWRmcuxBkrGCcDfQF3EURLQBNgK3gXtCrTonCqy");
+
+#[program]
+pub mod crecoin {
+    use super::*;
+
+    const CRE_ALLOCATION: u64 = 25; // %
+    const BUYBACK_RATE: u64 = 25; // %
+
+    #[access_control(authorize_cre_purchase(&ctx.accounts))]
+    pub fn acquire_cre(ctx: Context<AcquireCRE>) -> Result<()> {
+        let liquidity_pool = &ctx.accounts.liquidity_pool;
+        let cre_reserve = &ctx.accounts.cre_reserve;
+        
+        // Calculate 25% of LP tokens
+        let amount = liquidity_pool.amount.checked_div(4).unwrap(); 
+        
+        // Transfer from LP to CRE reserve
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: liquidity_pool.to_account_info(),
+                    to: cre_reserve.to_account_info(),
+                    authority: ctx.accounts.liquidity_authority.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+        
+        // Log real-world CRE purchase
+        emit!(CreAcquisition {
+            amount,
+            timestamp: Clock::get()?.unix_timestamp,
+            property_id: "NYC-10019".to_string()
+        });
+        
+        Ok(())
+    }
+
+    #[access_control(authorize_buyback(&ctx.accounts))]
+    pub fn execute_buyback(ctx: Context<ExecuteBuyback>, usdc_amount: u64) -> Result<()> {
+        // Swap USDC from CRE profits for CREC
+        let crec_out = DEX::swap(
+            ctx.accounts.usdc_vault.key(),
+            ctx.accounts.buyback_pool.key(),
+            usdc_amount,
+            SwapType::InputExactOutputMinimum
+        )?;
+        
+        // Burn bought tokens to reduce supply
+        token::burn(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Burn {
+                    mint: ctx.accounts.mint.to_account_info(),
+                    from: ctx.accounts.buyback_pool.to_account_info(),
+                    authority: ctx.accounts.buyback_authority.to_account_info(),
+                },
+            ),
+            crec_out,
+        )?;
+        
+        emit!(BuybackExecuted {
+            usdc_spent: usdc_amount,
+            crec_burned: crec_out,
+            circulating_supply: ctx.accounts.mint.supply
+        });
+
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct AcquireCRE<'info> {
+    #[account(
+        mut,
+        seeds = [b"liquidity"],
+        bump
+    )]
+    pub liquidity_pool: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        seeds = [b"cre_reserve"],
+        bump
+    )]
+    pub cre_reserve: Account<'info, TokenAccount>,
+    
+    #[account(
+        seeds = [b"liquidity_auth"],
+        bump
+    )]
+    pub liquidity_authority: AccountInfo<'info>,
+    
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteBuyback<'info> {
+    #[account(
+        mut,
+        seeds = [b"buyback"],
+        bump
+    )]
+    pub buyback_pool: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        seeds = [b"usdc_vault"],
+        bump
+    )]
+    pub usdc_vault: AccountInfo<'info>,
+    
+    #[account(
+        seeds = [b"buyback_auth"],
+        bump
+    )]
+    pub buyback_authority: AccountInfo<'info>,
+    
+    #[account(address = mint::ID)]
+    pub mint: Account<'info, Mint>,
+    
+    pub token_program: Program<'info, Token>,
+}
+
+// Custom authorization logic
+fn authorize_cre_purchase<'info>(ctx: &AcquireCRE<'info>) -> Result<()> {
+    require!(
+        ctx.liquidity_authority.key() == Pubkey::try_from(STRAUSS_WALLET).unwrap(),
+        CREError::Unauthorized
+    );
+    Ok(())
+}
+
+fn authorize_buyback<'info>(ctx: &ExecuteBuyback<'info>) -> Result<()> {
+    require!(
+        ctx.buyback_authority.key() == Pubkey::try_from(STRAUSS_WALLET).unwrap(),
+        CREError::Unauthorized
+    );
+    Ok(())
+}
+
+#[event]
+pub struct CreAcquisition {
+    pub amount: u64,
+    pub timestamp: i64,
+    pub property_id: String,
+}
+
+#[event]
+pub struct BuybackExecuted {
+    pub usdc_spent: u64,
+    pub crec_burned: u64,
+    pub circulating_supply: u64,
+}
+
+#[error_code]
+pub enum CREError {
+    #[msg("Unauthorized CRE operation")]
+    Unauthorized,
+}
 
